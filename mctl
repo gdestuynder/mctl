@@ -1,0 +1,238 @@
+#!/bin/bash
+
+## LICENSE
+#
+# mctl - super-set/wrapper for machinectl.
+# Copyright (C) 2015 <kang@insecure.ws> @kangsterizer
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+## WHAT IS THIS?! WHY IS THIS?!
+#
+# It's a super-set of machinectl. Eventually I'd hope to send PR's or see the same functionality directly inside of
+# machinectl. Until then, this wrapper makes my life easy and that's all that really matters, right?!
+# For more information, see also: <https://www.insecure.ws/linux/systemd_nspawn.html>
+#
+# /!\ WARNING /!\ This mostly only works on ArchLinux guests right now. Maybe forever.
+
+## CONFIGURATION
+#
+# Defaults are setup for systemd's machinectl/systemd-nspawn defaults.
+VERSION=2015-07-08
+DEFAULT_IMG=default-ns-1
+CONTAINERS_PATH=/var/lib/container
+#
+# Customize that part!
+DEFAULT_UID=1000
+DEFAULT_GID=1000
+DEFAULT_USER=kang
+OS_UPDATE_CMD="/usr/bin/pacman -Suy"
+#
+# Some "constants"
+C_BLUE='\e[01;34m'
+C_WHITE='\e[01;37m'
+C_RED='\e[01;31m'
+C_GREEN='\e[01;32m'
+C_RESET='\e[00m'
+
+## When stuff fail, die hard.
+#@ <error string>
+function _die()
+{
+	echo "ℹ error code $?" >&2
+	echo "⚠ $*" >&2
+	exit 127
+}
+
+## Fancy user messages.
+#@ <message to fancy-ize>
+function _msg()
+{
+	echo -e "${C_GREEN}>>> ${C_WHITE}$*${C_RESET}"
+}
+
+## Check for mounts, should you want them. This is mainly needed when you want to chroot from the main/host namespace,
+## since child namespaces will want their own mounts.
+#@ <machine>
+function ensure_mount()
+{
+	local p
+	[[ $(trap -p EXIT|grep $1) ]] && _die "attempting to overwrite existing EXIT trap"
+	trap "ensure_umount $1" EXIT
+
+	p=${CONTAINERS_PATH}/$1
+	[[ -d "$p" ]] || _die "$ is not a directory or does not exists."
+
+	findmnt $p > /dev/null || mount --bind ${p} ${p}
+	findmnt $p/dev > /dev/null || mount -onosuid,mode=0755 -t devtmpfs udev ${p}/dev
+	findmnt $p/dev/pts > /dev/null || mount -onosuid,nodev,noexec,mode=0620 -t devpts devpts ${p}/dev/pts
+	findmnt $p/proc > /dev/null || mount -onosuid,noexec,nodev -t proc proc ${p}/proc
+	findmnt $p/sys > /dev/null || mount -oro,nosuid,nodev,noexec -t sysfs sys ${p}/sys
+	findmnt $p/run > /dev/null || mount --bind /run ${p}/run
+}
+## Sister/brother/your-favorite-gender function to ensure_mount
+#@ <machine>
+function ensure_umount()
+{
+	local p
+	p=${CONTAINERS_PATH}/$1
+	findmnt $p/proc > /dev/null && umount ${p}/proc
+	findmnt $p/sys > /dev/null && umount ${p}/sys
+	findmnt $p/dev/pts > /dev/null && umount ${p}/dev/pts
+	findmnt $p/dev > /dev/null && umount ${p}/dev
+	findmnt $p/run > /dev/null && umount ${p}/run
+	findmnt $p > /dev/null || umount --bind ${p}
+	trap - EXIT
+}
+
+## Updates base machine (required) and all running machines (required as well)
+#@ NULL || <machine>
+function update()
+{
+	local p machines machine
+	p="${CONTAINERS_PATH}/${DEFAULT_IMG}"
+	_msg "UPDATING base machine"
+
+	ensure_mount ${DEFAULT_IMG}
+	chroot $p ${OS_UPDATE_CMD} || _die "base machine update failed."
+	ensure_umount ${DEFAULT_IMG}
+
+	_msg "UPDATING child machines"
+	# Single machine to update? ok.
+	if [[ "$1" != "" ]]; then
+		machines="$1"
+	else
+		machines=$(machinectl list|grep container|cut -d ' ' -f 1)
+	fi
+
+	for machine in $machines; do
+		 _msg "Updating $machine"
+		 p="${CONTAINERS_PATH}/$machine"
+		 # Only remount potential overlayfs mount points
+		findmnt $p > /dev/null && mount -oremount $p 2> /dev/null
+
+		enter -0 ${machine} ${OS_UPDATE_CMD} || _die "machine $machine update failed."
+		_msg "Reboot $machine NOW [Y/n]?"
+		read r && [[ "${r,,}" == "n" ]] && continue
+		machinectl reboot $machine || _die "machine $machine did not reboot properly."
+	done
+}
+
+## Helper to clear dead locks
+#@ <machine>
+function clear_lock()
+{
+	rm -yrf "${CONTAINERS_PATH}/.#${1}.lck"
+}
+
+## Find a process from a machine
+#@ <machine>
+function find_pid()
+{
+	machinectl status "$1" |grep Leader|awk '{print $2}'
+}
+
+## Enters the namespace and spawn a shell
+#@ [-q] <machine> [command]
+function enter()
+{
+	local pid machine p mountstuff uid gid
+	mounstuff=1
+	uid=${DEFAULT_UID}
+	gid=${DEFAULT_GID}
+
+	if [[ $1 == '-q' ]]; then
+		mountstuff=0
+		shift
+	elif [[ $1 == '-0' ]]; then
+		uid=0
+		gid=0
+		shift
+	fi
+	machine=$1
+	pid=$(find_pid $machine)
+	shift
+
+	# Construct command with imported environment
+	if [[ "$@" == "" ]]; then
+		CMD=$SHELL
+	else
+		CMD=$@
+	fi
+	# DUMMY is a safeguard in case some env variables we're importing are empty
+	ENV="env -i HOME=/home/$DEFAULT_USER USER=$DEFAULT_USER TERM=$TERM LANG=$LANG LC_ALL=$LC_ALL DUMMY=dummy"
+
+	nsenter -t ${pid} -p -m -u -i -r -S ${uid} -G ${gid} $ENV $CMD || _die "Couldn't enter namespace for $machine"
+}
+
+## Using systemd-run wraps more stuff, but is also still buggy and a bit limited, so this is a placeholder.
+#@ <machine>
+function enter2()
+{
+	systemd-run -M "$1" -p /bin/bash
+}
+
+## Duh.
+#@ NULL
+function usage()
+{
+	echo "USAGE: $0 <option> [machine]"
+	echo "Additional layer to manage machines ('containers') created by systemd-nspawn/machinectl."
+	echo "Basically a super-set of machinectl."
+	echo
+	echo "OPTIONS:"
+	echo -e "\t -v\t\t\t\t returns the version of this program."
+	echo -e "\t -r,-e <machine> [command]\t run a command inside the given machine - defaults to $SHELL."
+	echo -e "\t -q <machine> [command]\t\t run a command inside the given machine without mounting /proc and friends - defaults to $SHELL."
+	echo -e "\t -u\t\t\t\t updates the base machine and all running machines. all machines will restart."
+	echo
+	echo "EXAMPLES:"
+	echo -e "\t $0 -r postfix hostname"
+	echo -e "\t $0 -q weechat weechat"
+	echo -e "\t $0 -r weechat  #just enters in a shell!"
+	echo -e "\t $0 -u"
+	exit 127
+}
+
+## Main
+#@ argv
+[[ $# -eq 0 ]] && usage
+
+# standard getopt style arguments
+while getopts ":vuh:e:q:r:" opt; do
+	case $opt in
+		u)
+			update "$2"
+			;;
+		e|r)
+			shift
+			enter "$@"
+			;;
+		q)
+			enter "$@"
+			;;
+		v)
+			echo "$0 version $VERSION."
+			;;
+		h)
+			usage
+			;;
+		\?)
+			usage "invalid option -$OPTARG."
+			;;
+		:)
+			usage "option -$OPTARG requires an argument."
+			;;
+	esac
+done

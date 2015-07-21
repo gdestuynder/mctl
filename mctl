@@ -147,10 +147,11 @@ function find_pid()
 #@ [-q] <machine> [command]
 function enter()
 {
-	local pid machine p mountstuff uid gid
+	local pid machine p mountstuff uid gid CMD PRECMD ENV
 	mounstuff=1
 	uid=${DEFAULT_UID}
 	gid=${DEFAULT_GID}
+	PRECMD=""
 
 	if [[ $1 == '-q' ]]; then
 		mountstuff=0
@@ -158,6 +159,7 @@ function enter()
 	elif [[ $1 == '-0' ]]; then
 		uid=0
 		gid=0
+		PRECMD="script /dev/null -a -q -e -c"
 		shift
 	fi
 	machine=$1
@@ -173,7 +175,7 @@ function enter()
 	# DUMMY is a safeguard in case some env variables we're importing are empty
 	ENV="env -i HOME=/home/$DEFAULT_USER USER=$DEFAULT_USER TERM=$TERM LANG=$LANG LC_ALL=$LC_ALL DUMMY=dummy"
 
-	nsenter -t ${pid} -p -m -u -i -r -S ${uid} -G ${gid} $ENV $CMD || _die "Couldn't enter namespace for $machine"
+	nsenter -t ${pid} -p -m -u -i -r -S ${uid} -G ${gid} $ENV $PRECMD "$CMD" || _die "Couldn't enter namespace for $machine"
 }
 
 ## Using systemd-run wraps more stuff, but is also still buggy and a bit limited, so this is a placeholder.
